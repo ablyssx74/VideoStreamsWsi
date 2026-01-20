@@ -152,6 +152,7 @@ private:
 	LayerDevice *fDevice;
 	VkImage fImage;
 	VkDeviceMemory fMemory;
+	void *fMap {};
 
 public:
 	VKLayerImage();
@@ -160,6 +161,7 @@ public:
 
 	VkImage ToHandle() {return fImage;}
 	VkDeviceMemory GetMemoryHandle() {return fMemory;}
+	void *Map() const {return fMap;}
 };
 
 class BitmapHook {
@@ -245,6 +247,9 @@ VKLayerImage::VKLayerImage():
 
 VKLayerImage::~VKLayerImage()
 {
+	if (fMap != NULL) {
+		fDevice->Hooks().UnmapMemory(fDevice->ToHandle(), fMemory);
+	}
 	fDevice->Hooks().DestroyImage(fDevice->ToHandle(), fImage, NULL);
 	fDevice->Hooks().FreeMemory(fDevice->ToHandle(), fMemory, NULL);
 }
@@ -259,7 +264,7 @@ VkResult VKLayerImage::Init(LayerDevice *device, const VkImageCreateInfo &create
 	fDevice->Hooks().GetImageMemoryRequirements(fDevice->ToHandle(), fImage, &memRequirements);
 	size_t memTypeIdx = 0;
 	if (cpuMem) {
-		memTypeIdx = getMemoryTypeIndex(fDevice, memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+		memTypeIdx = getMemoryTypeIndex(fDevice, memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
 	} else {
 		for (; memTypeIdx < 8 * sizeof(memRequirements.memoryTypeBits); ++memTypeIdx) {
 			if (memRequirements.memoryTypeBits & (1u << memTypeIdx))
@@ -274,6 +279,7 @@ VkResult VKLayerImage::Init(LayerDevice *device, const VkImageCreateInfo &create
 		.memoryTypeIndex = (uint32_t)memTypeIdx
 	};
 
+#if 0
 	VkImportMemoryHostPointerInfoEXT hostPtrInfo;
 	AreaDeleter memArea;
 	if (area != NULL) {
@@ -288,11 +294,22 @@ VkResult VKLayerImage::Init(LayerDevice *device, const VkImageCreateInfo &create
 		};
 		memAllocInfo.pNext = &hostPtrInfo;
 	}
+#endif
 
 	VkCheckRet(fDevice->Hooks().AllocateMemory(fDevice->ToHandle(), &memAllocInfo, nullptr, &fMemory));
 	VkCheckRet(fDevice->Hooks().BindImageMemory(fDevice->ToHandle(), fImage, fMemory, 0));
 
+	if (area != NULL) {
+		VkCheckRet(fDevice->Hooks().MapMemory(fDevice->ToHandle(), fMemory, 0, memRequirements.size, 0, &fMap));
+		*area = area_for(fMap);
+		if (*area < B_OK) {
+			return VK_ERROR_UNKNOWN;
+		}
+	}
+
+#if 0
 	if (area != NULL) {*area = memArea.Detach();}
+#endif
 	return VK_SUCCESS;
 }
 
@@ -315,7 +332,7 @@ VkResult VKLayerSurface::Init(LayerInstance *instance, const VkHeadlessSurfaceCr
 VkResult VKLayerSurface::GetCapabilities(VkPhysicalDevice physDev, VkSurfaceCapabilitiesKHR *surfaceCapabilities)
 {
 	/* Image count limits */
-	surfaceCapabilities->minImageCount = 1;
+	surfaceCapabilities->minImageCount = 2;
 	surfaceCapabilities->maxImageCount = 3;
 
 	/* Surface extents */
@@ -348,20 +365,21 @@ VkResult VKLayerSurface::GetCapabilities(VkPhysicalDevice physDev, VkSurfaceCapa
 	surfaceCapabilities->supportedUsageFlags =
 		VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
 		VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
-	
+
 	return VK_SUCCESS;
 }
 
 VkResult VKLayerSurface::GetFormats(VkPhysicalDevice physDev, uint32_t *count, VkSurfaceFormatKHR *surfaceFormats)
 {
-/*
+#if 1
+	(void)physDev;
 	VkFormat formats[] = {VK_FORMAT_B8G8R8A8_UNORM};
-	uint32_t formatCnt = 1;
-*/
+	uint32_t formatCnt = B_COUNT_OF(formats);
+#else
 	constexpr int max_core_1_0_formats = VK_FORMAT_ASTC_12x12_SRGB_BLOCK + 1;
 	VkFormat formats[max_core_1_0_formats];
 	uint32_t formatCnt = 0;
-	
+
 	for (int format = 0; format < max_core_1_0_formats; format++) {
 		VkImageFormatProperties formatProps;
 		VkResult res = fInstance->Hooks().GetPhysicalDeviceImageFormatProperties(
@@ -373,6 +391,7 @@ VkResult VKLayerSurface::GetFormats(VkPhysicalDevice physDev, uint32_t *count, V
 			formats[formatCnt++] = (VkFormat)format;
 		}
 	}
+#endif
 
 	if (surfaceFormats == NULL) {
 		*count = formatCnt;
@@ -456,7 +475,7 @@ VkImageCreateInfo VKLayerSwapchain::ImageFromCreateInfo(const VkSwapchainCreateI
 		.arrayLayers = createInfo.imageArrayLayers,
 		.samples = VK_SAMPLE_COUNT_1_BIT,
 		.tiling = VK_IMAGE_TILING_OPTIMAL,
-		.usage = createInfo.imageUsage,
+		.usage = createInfo.imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 		.sharingMode = createInfo.imageSharingMode,
 		.queueFamilyIndexCount = createInfo.queueFamilyIndexCount,
 		.pQueueFamilyIndices = createInfo.pQueueFamilyIndices,
@@ -494,12 +513,12 @@ VkResult VKLayerSwapchain::CreateBuffer()
 		return VK_ERROR_OUT_OF_HOST_MEMORY;
 	area_id area;
 	VkCheckRet(fBuffer->Init(fDevice, createInfo, true, &area));
-	fBitmapArea.SetTo(area);
+//	fBitmapArea.SetTo(area);
 
 	VkImageSubresource subResource{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT};
 	VkSubresourceLayout subResourceLayout;
 	fDevice->Hooks().GetImageSubresourceLayout(fDevice->ToHandle(), fBuffer->ToHandle(), &subResource, &subResourceLayout);
-	fBitmap.SetTo(new(std::nothrow) BBitmap(fBitmapArea.Get(), 0, BRect(0, 0, fImageExtent.width - 1, fImageExtent.height - 1), B_BITMAP_IS_AREA, B_RGB32, subResourceLayout.rowPitch));
+	fBitmap.SetTo(new(std::nothrow) BBitmap(area, 0, BRect(0, 0, fImageExtent.width - 1, fImageExtent.height - 1), B_BITMAP_IS_AREA, B_RGB32, subResourceLayout.rowPitch));
 	if (!fBitmap.IsSet())
 		return VK_ERROR_OUT_OF_HOST_MEMORY;
 	fCurBitmap = fBitmap.Get();
@@ -535,6 +554,7 @@ VkResult VKLayerSwapchain::CopyToBuffer(VkImage srcImage, int32_t width, int32_t
 		VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
 	);
 
+#if 0
 	VkOffset3D blitSize{.x = width, .y = height, .z = 1};
 	VkImageBlit imageBlitRegion{
 		.srcSubresource = {
@@ -558,6 +578,33 @@ VkResult VKLayerSwapchain::CopyToBuffer(VkImage srcImage, int32_t width, int32_t
 		&imageBlitRegion,
 		VK_FILTER_NEAREST
 	);
+#endif
+#if 1
+	VkImageCopy imageCopyRegion{
+		.srcSubresource = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.layerCount = 1
+		},
+		.dstSubresource = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.layerCount = 1
+		},
+		.extent = {
+			.width  = (uint32_t)width,
+			.height = (uint32_t)height,
+			.depth  = 1
+		}
+	};
+
+	// Issue the copy command
+	fDevice->Hooks().CmdCopyImage(
+		copyCmd,
+		srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		fBuffer->ToHandle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		1,
+		&imageCopyRegion
+	);
+#endif
 
 	// Transition destination image to general layout, which is the required layout for mapping the image memory later on
 	insertImageMemoryBarrier(
@@ -662,12 +709,12 @@ VkResult VKLayerSwapchain::AcquireNextImage(const VkAcquireNextImageInfoKHR *pAc
 
 	if (VK_NULL_HANDLE != pAcquireInfo->semaphore || VK_NULL_HANDLE != pAcquireInfo->fence) {
 		VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-	
+
 		if (VK_NULL_HANDLE != pAcquireInfo->semaphore) {
 			submit.signalSemaphoreCount = 1;
 			submit.pSignalSemaphores = &pAcquireInfo->semaphore;
 		}
-	
+
 		submit.commandBufferCount = 0;
 		submit.pCommandBuffers = nullptr;
 		VkCheckRet(fDevice->Hooks().QueueSubmit(fQueue, 1, &submit, pAcquireInfo->fence));

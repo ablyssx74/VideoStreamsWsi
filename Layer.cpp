@@ -6,6 +6,7 @@
 #include <pthread.h>
 
 #include <map>
+#include <vector>
 
 #include <OS.h>
 #include <private/shared/AutoDeleter.h>
@@ -49,13 +50,23 @@ VkResult LayerInstance::Init(const VkInstanceCreateInfo* pCreateInfo, const VkAl
     layerCreateInfo = (VkLayerInstanceCreateInfo *)layerCreateInfo->pNext;
   }
 	if (layerCreateInfo == NULL) return VK_ERROR_INITIALIZATION_FAILED;
-
+	
+	VkInstanceCreateInfo modifiedInfo = *pCreateInfo;
+	std::vector<const char*> modifiedExtensionNames;
+	for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
+		const char *extensionName = pCreateInfo->ppEnabledExtensionNames[i];
+		if (strcmp(extensionName, "VK_EXT_headless_surface") != 0) {
+			modifiedExtensionNames.push_back(extensionName);
+		}
+	}
+	modifiedInfo.ppEnabledExtensionNames = modifiedExtensionNames.data();
+	modifiedInfo.enabledExtensionCount = modifiedExtensionNames.size();
 
 	fHooks.GetInstanceProcAddr = layerCreateInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
   layerCreateInfo->u.pLayerInfo = layerCreateInfo->u.pLayerInfo->pNext;
 	fHooks.CreateInstance = (PFN_vkCreateInstance)fHooks.GetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
 
-	VkCheckRet(fHooks.CreateInstance(pCreateInfo, pAllocator, pInstance));
+	VkCheckRet(fHooks.CreateInstance(&modifiedInfo, pAllocator, pInstance));
 	fBaseInstance = *pInstance;
 
 #define REQUIRED(x) fHooks.x = (PFN_vk##x)fHooks.GetInstanceProcAddr(fBaseInstance, "vk" #x);
