@@ -13,9 +13,9 @@
 #include <private/shared/PthreadMutexLocker.h>
 
 
-pthread_mutex_t sInstanceMapLock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+pthread_mutex_t sInstanceMapLock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 std::map<VkInstance, ObjectDeleter<LayerInstance>> sInstanceMap;
-pthread_mutex_t sDeviceMapLock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+pthread_mutex_t sDeviceMapLock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 std::map<VkDevice, ObjectDeleter<LayerDevice>> sDeviceMap;
 
 
