@@ -1,3 +1,4 @@
+#include <vector>
 #include "Wsi.h"
 
 #include <OS.h>
@@ -199,6 +200,7 @@ public:
 	VkSurfaceKHR ToHandle() {return (VkSurfaceKHR)this;}
 
 	BitmapHook *GetBitmapHook() {return fBitmapHook;}
+	VKLayerSwapchain *GetSwapchain() {return fSwapchain;}
 	void SetBitmapHook(BitmapHook *hook) override;
 };
 
@@ -215,6 +217,7 @@ private:
 	VkQueue fQueue = VK_NULL_HANDLE;
 	VkFence fFence = VK_NULL_HANDLE;
 	bool fRetired = false;
+	VkPresentModeKHR fPresentMode = VK_PRESENT_MODE_FIFO_KHR;
 
 	ObjectDeleter<BBitmap> fBitmap;
 	AreaDeleter fBitmapArea;
@@ -233,6 +236,8 @@ public:
 	VkResult GetSwapchainImages(uint32_t *count, VkImage *images);
 	VkResult AcquireNextImage(const VkAcquireNextImageInfoKHR *pAcquireInfo, uint32_t *pImageIndex);
 	VkResult QueuePresent(VkQueue queue, const VkPresentInfoKHR *present_info, uint32_t idx);
+
+	VkPresentModeKHR PresentMode() const {return fPresentMode;}
 
 	static VKLayerSwapchain *FromHandle(VkSwapchainKHR surface) {return (VKLayerSwapchain*)surface;}
 	VkSwapchainKHR ToHandle() {return (VkSwapchainKHR)this;}
@@ -397,24 +402,31 @@ VkResult VKLayerSurface::GetFormats(VkPhysicalDevice physDev, uint32_t *count, V
 		*count = formatCnt;
 		return VK_SUCCESS;
 	}
-	memcpy(surfaceFormats, formats, sizeof(VkFormat)*std::min<uint32_t>(*count, formatCnt));
-	if (*count < formatCnt)
-		return VK_INCOMPLETE;
-	return VK_SUCCESS;
+	uint32_t copyCnt = std::min<uint32_t>(*count, formatCnt);
+	for (uint32_t i = 0; i < copyCnt; i++) {
+		surfaceFormats[i].format = formats[i];
+		surfaceFormats[i].colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+	}
+	bool incomplete = *count < formatCnt;
+	*count = copyCnt;   // the number written, as the spec asks
+	return incomplete ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 VkResult VKLayerSurface::GetPresentModes(VkPhysicalDevice physDev, uint32_t *count, VkPresentModeKHR *presentModes)
 {
 	(void)physDev;
-	static const VkPresentModeKHR modes[] = {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR};
+	// FIFO is "V-sync on" for a program (DXVK and vkd3d-proton ask for it with a swap interval above 0), IMMEDIATE "V-sync off". Wine tells the
+	// two apart through VideoStreamsWsi_PresentMode() below: the frames of a FIFO swapchain are paced by the display, the others are not.
+	static const VkPresentModeKHR modes[] = {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR};
 	if (presentModes == NULL) {
 		*count = B_COUNT_OF(modes);
 		return VK_SUCCESS;
 	}
-	memcpy(presentModes, modes, sizeof(VkPresentModeKHR)*std::min<uint32_t>(*count, B_COUNT_OF(modes)));
-	if (*count < B_COUNT_OF(modes))
-		return VK_INCOMPLETE;
-	return VK_SUCCESS;
+	uint32_t copyCnt = std::min<uint32_t>(*count, B_COUNT_OF(modes));
+	memcpy(presentModes, modes, sizeof(VkPresentModeKHR)*copyCnt);
+	bool incomplete = *count < B_COUNT_OF(modes);
+	*count = copyCnt;   // the number written, as the spec asks
+	return incomplete ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 VkResult VKLayerSurface::GetPresentRectangles(VkPhysicalDevice physDev, uint32_t* pRectCount, VkRect2D* pRects)
@@ -646,6 +658,7 @@ VkResult VKLayerSwapchain::Init(LayerDevice *device, const VkSwapchainCreateInfo
 {
 	fDevice = device;
 	fSurface = VKLayerSurface::FromHandle(createInfo.surface);
+	fPresentMode = createInfo.presentMode;
 
 	VKLayerSwapchain *oldSwapchain = NULL;
 	if (createInfo.oldSwapchain != NULL) {
@@ -697,9 +710,11 @@ VkResult VKLayerSwapchain::GetSwapchainImages(uint32_t *count, VkImage *images)
 	for (uint32_t i = 0; i < copyCnt; i++) {
 		images[i] = fImages[i].ToHandle();
 	}
-	if (*count < fImageCnt)
-		return VK_INCOMPLETE;
-	return VK_SUCCESS;
+	bool incomplete = *count < fImageCnt;
+	// The number written goes back to the caller (the spec asks for it). Without it a caller that gave room for more images than
+	// the swapchain has (vkd3d-proton does) goes on to use the images that were never written: a null image in vkCreateImageView.
+	*count = copyCnt;
+	return incomplete ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 VkResult VKLayerSwapchain::AcquireNextImage(const VkAcquireNextImageInfoKHR *pAcquireInfo, uint32_t *pImageIndex)
@@ -776,11 +791,8 @@ void Layer_DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const Vk
 
 VkResult Layer_GetPhysicalDeviceSurfaceCapabilities2KHR(VkPhysicalDevice physDev, const VkPhysicalDeviceSurfaceInfo2KHR *surface_info, VkSurfaceCapabilities2KHR *capabilities)
 {
-	(void)physDev;
-	(void)surface_info;
-	(void)capabilities;
-	fprintf(stderr, "vkGetPhysicalDeviceSurfaceCapabilities2KHR(): not implemented\n");
-	return VK_NOT_READY;
+	// Same answer as vkGetPhysicalDeviceSurfaceCapabilitiesKHR(); there are no extension structures in the chain that the layer fills.
+	return VKLayerSurface::FromHandle(surface_info->surface)->GetCapabilities(physDev, &capabilities->surfaceCapabilities);
 }
 
 VkResult Layer_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physDev, VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR *capabilities)
@@ -790,12 +802,17 @@ VkResult Layer_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physDev,
 
 VkResult Layer_GetPhysicalDeviceSurfaceFormats2KHR(VkPhysicalDevice physDev, const VkPhysicalDeviceSurfaceInfo2KHR *surface_info, uint32_t *count, VkSurfaceFormat2KHR *formats)
 {
-	(void)physDev;
-	(void)surface_info;
-	(void)count;
-	(void)formats;
-	fprintf(stderr, "vkGetPhysicalDeviceSurfaceFormats2KHR(): not implemented\n");
-	return VK_NOT_READY;
+	VKLayerSurface *surface = VKLayerSurface::FromHandle(surface_info->surface);
+	if (formats == NULL)
+		return surface->GetFormats(physDev, count, NULL);
+
+	std::vector<VkSurfaceFormatKHR> plain(*count);
+	uint32_t n = *count;
+	VkResult res = surface->GetFormats(physDev, &n, plain.data());
+	for (uint32_t i = 0; i < n; i++)
+		formats[i].surfaceFormat = plain[i];
+	*count = n;
+	return res;
 }
 
 VkResult Layer_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physDev, VkSurfaceKHR surface, uint32_t *count, VkSurfaceFormatKHR *formats)
@@ -887,4 +904,15 @@ VkResult Layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentIn
 	}
 
 	return ret;
+}
+
+
+/* What Wine asks (it finds the symbol in this library's image, so an older layer just does not have it): the present mode of the surface's
+ * swapchain as a VkPresentModeKHR number, or -1 when the surface has none (yet). */
+extern "C" _EXPORT int VideoStreamsWsi_PresentMode(void *surface)
+{
+	VKLayerSurface *layerSurface = (VKLayerSurface *)surface;
+	if (layerSurface == NULL || layerSurface->GetSwapchain() == NULL)
+		return -1;
+	return (int)layerSurface->GetSwapchain()->PresentMode();
 }
