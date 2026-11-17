@@ -183,6 +183,8 @@ private:
 	LayerInstance *fInstance = NULL;
 	VKLayerSwapchain *fSwapchain = NULL;
 	BitmapHook *fBitmapHook = NULL;
+	void (*fGone)(void *) = NULL;
+	void *fGoneUser = NULL;
 
 	friend class VKLayerSwapchain;
 
@@ -202,6 +204,7 @@ public:
 	BitmapHook *GetBitmapHook() {return fBitmapHook;}
 	VKLayerSwapchain *GetSwapchain() {return fSwapchain;}
 	void SetBitmapHook(BitmapHook *hook) override;
+	void SetGone(void (*gone)(void *), void *user) {fGone = gone; fGoneUser = user;}
 };
 
 class VKLayerSwapchain {
@@ -325,7 +328,16 @@ VKLayerSurface::VKLayerSurface()
 {}
 
 VKLayerSurface::~VKLayerSurface()
-{}
+{
+	// Whoever put a hook on the surface (Wine's driver) has no other way to learn that it is gone: it can ask for a call
+	// (VideoStreamsWsi_SetSurfaceGone() below) to free what it made for the surface, and the hook itself, with the last bitmap it holds,
+	// is deleted here. Before this every surface a program made and destroyed (DXVK makes one for every swapchain) left its hook, its
+	// bitmap and its buffers behind until the program ended.
+	if (fGone != NULL)
+		fGone(fGoneUser);
+	delete fBitmapHook;
+	fBitmapHook = NULL;
+}
 
 VkResult VKLayerSurface::Init(LayerInstance *instance, const VkHeadlessSurfaceCreateInfoEXT &createInfo)
 {
@@ -915,4 +927,13 @@ extern "C" _EXPORT int VideoStreamsWsi_PresentMode(void *surface)
 	if (layerSurface == NULL || layerSurface->GetSwapchain() == NULL)
 		return -1;
 	return (int)layerSurface->GetSwapchain()->PresentMode();
+}
+
+/* What Wine's driver calls (it finds the symbol in this library's image, so an older layer just does not have it): gone(user) is called
+ * when the program destroys the surface, after it destroyed the surface's swapchain. Wine frees the buffers it made for the surface. */
+extern "C" _EXPORT void VideoStreamsWsi_SetSurfaceGone(void *surface, void (*gone)(void *), void *user)
+{
+	VKLayerSurface *layerSurface = (VKLayerSurface *)surface;
+	if (layerSurface != NULL)
+		layerSurface->SetGone(gone, user);
 }
