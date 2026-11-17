@@ -67,6 +67,65 @@ static void insertImageMemoryBarrier(
 	);
 }
 
+// One lock for every use of a VkQueue that goes through this layer (the layer's own submits and the program's own, which Layer_QueueSubmit
+// and its siblings below route here). A VkQueue must not be used from two threads at once; Zink presents from its own thread and the layer
+// submits from whichever thread acquires. Only the call itself is locked, never a wait for a fence, so no wait can hold up the submit it needs.
+static pthread_mutex_t gQueueLock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+static PFN_vkQueueSubmit gNextQueueSubmit = NULL;
+static PFN_vkQueueSubmit2 gNextQueueSubmit2 = NULL;
+static PFN_vkQueueSubmit2 gNextQueueSubmit2KHR = NULL;
+static PFN_vkQueueWaitIdle gNextQueueWaitIdle = NULL;
+static PFN_vkQueueBindSparse gNextQueueBindSparse = NULL;
+
+static VkResult lockedSubmit(LayerDevice *lrDev, VkQueue queue, uint32_t count, const VkSubmitInfo *info, VkFence fence)
+{
+	PthreadMutexLocker lock(&gQueueLock);
+	return lrDev->Hooks().QueueSubmit(queue, count, info, fence);
+}
+
+VkResult VKAPI_CALL Layer_QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *info, VkFence fence)
+{
+	PthreadMutexLocker lock(&gQueueLock);
+	return gNextQueueSubmit(queue, count, info, fence);
+}
+
+VkResult VKAPI_CALL Layer_QueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2 *info, VkFence fence)
+{
+	PthreadMutexLocker lock(&gQueueLock);
+	return gNextQueueSubmit2(queue, count, info, fence);
+}
+
+VkResult VKAPI_CALL Layer_QueueSubmit2KHR(VkQueue queue, uint32_t count, const VkSubmitInfo2 *info, VkFence fence)
+{
+	PthreadMutexLocker lock(&gQueueLock);
+	return gNextQueueSubmit2KHR(queue, count, info, fence);
+}
+
+VkResult VKAPI_CALL Layer_QueueWaitIdle(VkQueue queue)
+{
+	PthreadMutexLocker lock(&gQueueLock);
+	return gNextQueueWaitIdle(queue);
+}
+
+VkResult VKAPI_CALL Layer_QueueBindSparse(VkQueue queue, uint32_t count, const VkBindSparseInfo *info, VkFence fence)
+{
+	PthreadMutexLocker lock(&gQueueLock);
+	return gNextQueueBindSparse(queue, count, info, fence);
+}
+
+// The layer's device lookup calls these to remember the next layer's entry for each name it routes.
+PFN_vkVoidFunction Layer_RouteQueueCall(const char *name, PFN_vkVoidFunction next)
+{
+	if (next == NULL)
+		return NULL;
+	if (!strcmp(name, "vkQueueSubmit")) { gNextQueueSubmit = (PFN_vkQueueSubmit)next; return (PFN_vkVoidFunction)&Layer_QueueSubmit; }
+	if (!strcmp(name, "vkQueueSubmit2")) { gNextQueueSubmit2 = (PFN_vkQueueSubmit2)next; return (PFN_vkVoidFunction)&Layer_QueueSubmit2; }
+	if (!strcmp(name, "vkQueueSubmit2KHR")) { gNextQueueSubmit2KHR = (PFN_vkQueueSubmit2)next; return (PFN_vkVoidFunction)&Layer_QueueSubmit2KHR; }
+	if (!strcmp(name, "vkQueueWaitIdle")) { gNextQueueWaitIdle = (PFN_vkQueueWaitIdle)next; return (PFN_vkVoidFunction)&Layer_QueueWaitIdle; }
+	if (!strcmp(name, "vkQueueBindSparse")) { gNextQueueBindSparse = (PFN_vkQueueBindSparse)next; return (PFN_vkVoidFunction)&Layer_QueueBindSparse; }
+	return next;
+}
+
 static VkResult submitWork(LayerDevice *lrDev, VkCommandBuffer cmdBuffer, VkQueue queue)
 {
 	VkSubmitInfo submitInfo{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -75,7 +134,7 @@ static VkResult submitWork(LayerDevice *lrDev, VkCommandBuffer cmdBuffer, VkQueu
 	VkFenceCreateInfo fenceInfo{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 	VkFence fence;
 	VkCheckRet(lrDev->Hooks().CreateFence(lrDev->ToHandle(), &fenceInfo, nullptr, &fence));
-	VkCheckRet(lrDev->Hooks().QueueSubmit(queue, 1, &submitInfo, fence));
+	VkCheckRet(lockedSubmit(lrDev, queue, 1, &submitInfo, fence));
 	VkCheckRet(lrDev->Hooks().WaitForFences(lrDev->ToHandle(), 1, &fence, VK_TRUE, UINT64_MAX));
 	lrDev->Hooks().DestroyFence(lrDev->ToHandle(), fence, nullptr);
 	return VK_SUCCESS;
@@ -97,6 +156,8 @@ public:
 
 	bool Add(int32 val);
 	int32 Remove();
+	// false when no item came within timeoutNs (0 = do not wait; UINT64_MAX = wait for ever)
+	bool Remove(int32 &out, uint64_t timeoutNs);
 };
 
 BufferQueue::BufferQueue():
@@ -130,6 +191,32 @@ bool BufferQueue::Add(int32 val)
 	fItems[(fBeg + fLen)%fMaxLen] = val;
 	if (fLen == 0) pthread_cond_signal(&fEmptyCv);
 	fLen++;
+	return true;
+}
+
+bool BufferQueue::Remove(int32 &out, uint64_t timeoutNs)
+{
+	PthreadMutexLocker lock(&fLock);
+	if (timeoutNs == UINT64_MAX) {
+		while (!(fLen > 0)) pthread_cond_wait(&fEmptyCv, &fLock);
+	} else if (!(fLen > 0)) {
+		if (timeoutNs == 0)
+			return false;
+		struct timespec until;
+		clock_gettime(CLOCK_REALTIME, &until);
+		uint64_t ns = (uint64_t)until.tv_nsec + timeoutNs % 1000000000ULL;
+		uint64_t secs = timeoutNs / 1000000000ULL;
+		if (secs > 100000000ULL) secs = 100000000ULL;
+		until.tv_sec += (time_t)secs + (time_t)(ns / 1000000000ULL);
+		until.tv_nsec = (long)(ns % 1000000000ULL);
+		while (!(fLen > 0)) {
+			if (pthread_cond_timedwait(&fEmptyCv, &fLock, &until) != 0 && !(fLen > 0))
+				return false;
+		}
+	}
+	out = fItems[fBeg%fMaxLen];
+	fBeg = (fBeg + 1)%fMaxLen;
+	fLen--;
 	return true;
 }
 
@@ -472,7 +559,7 @@ VKLayerSwapchain::~VKLayerSwapchain()
 {
 	if (fCommandPool != VK_NULL_HANDLE) {
 		fDevice->Hooks().DestroyCommandPool(fDevice->ToHandle(), fCommandPool, nullptr);
-		fDevice->Hooks().QueueWaitIdle(fQueue);
+		{ PthreadMutexLocker qlock(&gQueueLock); fDevice->Hooks().QueueWaitIdle(fQueue); }
 	}
 
 	fDevice->Hooks().DestroyFence(fDevice->ToHandle(), fFence, NULL);
@@ -730,7 +817,10 @@ VkResult VKLayerSwapchain::GetSwapchainImages(uint32_t *count, VkImage *images)
 
 VkResult VKLayerSwapchain::AcquireNextImage(const VkAcquireNextImageInfoKHR *pAcquireInfo, uint32_t *pImageIndex)
 {
-	int32 imageIdx = fImagePool.Remove();
+	// Honour the caller's timeout: Zink asks with 0 and expects VK_NOT_READY (and then tries again) when every image is still out.
+	int32 imageIdx;
+	if (!fImagePool.Remove(imageIdx, pAcquireInfo->timeout))
+		return pAcquireInfo->timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
 	*pImageIndex = imageIdx;
 
 	if (VK_NULL_HANDLE != pAcquireInfo->semaphore || VK_NULL_HANDLE != pAcquireInfo->fence) {
@@ -743,7 +833,7 @@ VkResult VKLayerSwapchain::AcquireNextImage(const VkAcquireNextImageInfoKHR *pAc
 
 		submit.commandBufferCount = 0;
 		submit.pCommandBuffers = nullptr;
-		VkCheckRet(fDevice->Hooks().QueueSubmit(fQueue, 1, &submit, pAcquireInfo->fence));
+		VkCheckRet(lockedSubmit(fDevice, fQueue, 1, &submit, pAcquireInfo->fence));
 	}
 
 	return CheckSuboptimal();
@@ -758,7 +848,7 @@ VkResult VKLayerSwapchain::QueuePresent(VkQueue queue, const VkPresentInfoKHR *p
 		VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, presentInfo->waitSemaphoreCount, presentInfo->pWaitSemaphores, &pipeline_stage_flags, 0, NULL, 0, NULL
 	};
 
-	VkResult result = fDevice->Hooks().QueueSubmit(queue, 1, &submit_info, fFence);
+	VkResult result = lockedSubmit(fDevice, queue, 1, &submit_info, fFence);
 	if (result == VK_SUCCESS) {
 		fDevice->Hooks().WaitForFences(fDevice->ToHandle(), 1, &fFence, VK_TRUE, UINT64_MAX);
 	}

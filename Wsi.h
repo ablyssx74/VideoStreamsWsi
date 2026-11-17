@@ -20,3 +20,5 @@ void     VKAPI_CALL Layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR sw
 VkResult VKAPI_CALL Layer_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain, uint32_t *count, VkImage *images);
 VkResult VKAPI_CALL Layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t *pImageIndex);
 VkResult VKAPI_CALL Layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo);
+
+PFN_vkVoidFunction Layer_RouteQueueCall(const char *name, PFN_vkVoidFunction next);

@@ -290,7 +290,7 @@ extern "C" _EXPORT PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice de
 
 	LayerDevice *layerDev = LayerDevice::FromHandle(device);
 	if (layerDev == NULL) return NULL;
-	return layerDev->GetDeviceProcAddr(pName);
+	return Layer_RouteQueueCall(pName, layerDev->GetDeviceProcAddr(pName));
 }
 
 extern "C" _EXPORT VkResult VKAPI_CALL vkEnumerateInstanceExtensionProperties(const VkEnumerateInstanceExtensionPropertiesChain *chain, const char *pLayerName, uint32_t *pCount, VkExtensionProperties *pProperties)
