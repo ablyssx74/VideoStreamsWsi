@@ -329,13 +329,12 @@ VKLayerSurface::VKLayerSurface()
 
 VKLayerSurface::~VKLayerSurface()
 {
-	// Whoever put a hook on the surface (Wine's driver) has no other way to learn that it is gone: it can ask for a call
-	// (VideoStreamsWsi_SetSurfaceGone() below) to free what it made for the surface, and the hook itself, with the last bitmap it holds,
-	// is deleted here. Before this every surface a program made and destroyed (DXVK makes one for every swapchain) left its hook, its
-	// bitmap and its buffers behind until the program ended.
+	// The hook belongs to whoever put it on the surface: Wine's driver made it in its own library, Mesa's Zink (OpenGL on Vulkan, which
+	// Firefox uses) has its own, and each frees it with its own allocator or keeps it as part of a larger object, so the layer must
+	// not free it (doing so crashed Firefox in free() in release 0.0.2-20). A client that has to know when the surface is gone (Wine's
+	// driver, to free the buffers and the hook it made) asks for a call with VideoStreamsWsi_SetSurfaceGone() below.
 	if (fGone != NULL)
 		fGone(fGoneUser);
-	delete fBitmapHook;
 	fBitmapHook = NULL;
 }
 
@@ -930,7 +929,7 @@ extern "C" _EXPORT int VideoStreamsWsi_PresentMode(void *surface)
 }
 
 /* What Wine's driver calls (it finds the symbol in this library's image, so an older layer just does not have it): gone(user) is called
- * when the program destroys the surface, after it destroyed the surface's swapchain. Wine frees the buffers it made for the surface. */
+ * when the program destroys the surface, after it destroyed the surface's swapchain. Wine frees the buffers and the hook it made for the surface; the layer frees nothing it did not make. */
 extern "C" _EXPORT void VideoStreamsWsi_SetSurfaceGone(void *surface, void (*gone)(void *), void *user)
 {
 	VKLayerSurface *layerSurface = (VKLayerSurface *)surface;
